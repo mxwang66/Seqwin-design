@@ -1,4 +1,5 @@
 import logging
+from io import StringIO
 from pathlib import Path
 from itertools import repeat
 from collections.abc import Iterable
@@ -32,6 +33,7 @@ SUFFIX_NEG = 'neg'
 VARVAMP_DIR = 'varvamp'
 VARVAMP_DESIGN = 'qpcr_design.tsv'
 VARVAMP_PRIMERS = 'qpcr_primers.tsv'
+MIN_MISMATCH = 3
 METRICS = {
     'log10_hits': -1, 
     'varVAMP_p': -1, 
@@ -62,9 +64,10 @@ def _msa_worker(i: int, blast_out: pd.DataFrame, msa_prefix: Path) -> Path:
 
     neg = blast_out[~blast_out['is_target']]
     neg_msa_path = msa_prefix / Path(f'{i}-{SUFFIX_NEG}.fasta')
-    neg_msa_path.write_text(
-        mafft(neg['sseq'], neg['assembly_idx'], 1)
-    )
+    # no MSA for non-targets; use BLAST to calculate specificity
+    neg_msa_path.write_text(''.join(
+        list(f'>{h}\n{s}\n' for h, s in zip(neg['assembly_idx'], neg['sseq']))
+    ))
 
     return tar_msa_path
 
@@ -95,6 +98,49 @@ def _blast_nt(markers: list[ConnectedKmers], taxid: int, prefix: Path, n_cpu: in
     return n_hits
 
 
+def _get_specificity(fasta_path: Path, oligos: list[str], n_neg: int):
+    # check if fasta file is empty
+    if fasta_path.stat().st_size == 0:
+        return 1.
+
+    # create input fasta for blast
+    blast_in = ''.join(
+        f'>{i}\n{o}\n' for i, o in enumerate(oligos)
+    )
+
+    # prepare blastn args
+    args = [
+        'blastn', 
+        '-subject', fasta_path, 
+        '-task', 'blastn-short', 
+        '-outfmt', '6 qseqid sseqid nident', 
+        '-max_hsps', '1', 
+        '-max_target_seqs', '50000'
+    ]
+
+    # run BLAST (output to stdout)
+    blast_out = run_cmd(
+        *args, stdin=blast_in # input fasta as stdin
+    ).stdout
+
+    # convert BLAST output into a df. pd.read_csv() does auto type conversion (e.g., 'qseqid' as int)
+    blast_out = pd.read_csv(
+        StringIO(blast_out), sep='\t', header=None, 
+        names=('qseqid', 'sseqid', 'nident'), index_col=False
+    )
+
+    passed = set()
+    for i, g in blast_out.groupby('qseqid', sort=False):
+        g.sort_values('sseqid', inplace=True)
+        n_diff = - g['nident'] + len(oligos[i])
+        passed.update(
+            # genomes with more than MIN_MISMATCH mismatches / gaps
+            g[n_diff >= MIN_MISMATCH]['sseqid']
+        )
+
+    return len(passed) / n_neg
+
+
 def _eval_designs(
     varvamp_prefix: Path, msa_prefix: Path, n_markers: int, n_tar: int, n_neg: int, n_cpu: int
 ) -> NDArray:
@@ -118,7 +164,7 @@ def _eval_designs(
         # get the oligo sequences of the best design
         df = pd.read_csv(curr_design / VARVAMP_PRIMERS, sep='\t')
         design = df[df['qpcr_scheme'] == design]
-        oligos = design['seq']
+        oligos = list(design['seq'])
 
         # sensitivity
         tar_msa_path = msa_prefix / Path(f'{i}-{SUFFIX_TAR}.fasta')
@@ -129,17 +175,8 @@ def _eval_designs(
         metrics[i, 1] = sum(np.logical_and.reduce(tar_match)) / n_tar
 
         # specificity
-        neg_msa_path = msa_prefix / Path(f'{i}-{SUFFIX_NEG}.fasta')
-        try:
-            neg_msa = MSA(neg_msa_path, n_cpu)
-            neg_match = list(
-                neg_msa.attach_oligo(o) for o in oligos
-            )
-            # use logical_or for neg
-            metrics[i, 2] = 1 - sum(np.logical_or.reduce(neg_match)) / n_neg
-        except IndexError:
-            # MSA file is empty
-            metrics[i, 2] = 1.
+        neg_seq_path = msa_prefix / Path(f'{i}-{SUFFIX_NEG}.fasta')
+        metrics[i, 2] = _get_specificity(neg_seq_path, oligos, n_neg)
 
     return metrics
 
@@ -217,6 +254,8 @@ if __name__ == '__main__':
     Output: a folder named `<seqwin_out>.design`. 
     - The best varVAMP design is selected for each Seqwin signature. 
     - Some signatures might have no design. 
+
+    NOTE: varVAMP designs are not deterministic for the same input MSA. 
 
     Folder structure:
     - msa/: Multiple sequence alignment (MSA) of each signature. 
