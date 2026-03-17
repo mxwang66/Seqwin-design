@@ -129,16 +129,17 @@ def _get_specificity(fasta_path: Path, oligos: list[str], n_neg: int):
         names=('qseqid', 'sseqid', 'nident'), index_col=False
     )
 
-    passed = set()
+    non_specific = list()
     for i, g in blast_out.groupby('qseqid', sort=False):
         g.sort_values('sseqid', inplace=True)
         n_diff = - g['nident'] + len(oligos[i])
-        passed.update(
-            # genomes with more than MIN_MISMATCH mismatches / gaps
-            g[n_diff >= MIN_MISMATCH]['sseqid']
-        )
+        non_specific.append(set(
+            # genomes with less than MIN_MISMATCH mismatches / gaps
+            g[n_diff < MIN_MISMATCH]['sseqid']
+        ))
+    non_specific = set.intersection(*non_specific)
 
-    return len(passed) / n_neg
+    return 1 - len(non_specific) / n_neg
 
 
 def _eval_designs(
